@@ -177,6 +177,7 @@ class CompletionRequest(BaseModel):
     repetition_penalty: Optional[float] = 1.0
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
     no_stop_trim: Union[bool, List[bool]] = False
+    lora_path: Optional[str] = None
 
 
 class CompletionResponseChoice(BaseModel):
@@ -281,6 +282,7 @@ class ChatCompletionRequest(BaseModel):
     repetition_penalty: Optional[float] = 1.0
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
     ignore_eos: bool = False
+    lora_path: Optional[str] = None
 
 
 class ChatMessage(BaseModel):
