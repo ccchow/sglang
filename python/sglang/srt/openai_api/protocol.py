@@ -176,6 +176,7 @@ class CompletionRequest(BaseModel):
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
+    lora_path: Optional[str] = None
 
 
 class CompletionResponseChoice(BaseModel):
@@ -282,6 +283,7 @@ class ChatCompletionRequest(BaseModel):
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
+    lora_path: Optional[str] = None
 
 
 class ChatMessage(BaseModel):
