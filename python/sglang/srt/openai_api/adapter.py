@@ -888,13 +888,13 @@ def v1_chat_generate_request(
                 else:
                     assistant_prefix = None
 
-                prompt_ids = []
-                if (tokenizer_manager.tokenizer.chat_template is not None):
-                    prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
-                        openai_compatible_messages,
-                        tokenize=True,
-                        add_generation_prompt=True,
-                    )
+                # prompt_ids = []
+                # if (tokenizer_manager.tokenizer.chat_template is not None):
+                prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
+                    openai_compatible_messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                )
                 if assistant_prefix:
                     prompt_ids += tokenizer_manager.tokenizer.encode(assistant_prefix)
                 stop = request.stop
