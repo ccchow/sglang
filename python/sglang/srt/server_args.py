@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """The arguments of the server."""
 
 import argparse
@@ -22,7 +20,17 @@ import random
 import tempfile
 from typing import List, Optional
 
-from sglang.srt.utils import is_flashinfer_available, is_ipv6, is_port_available
+import torch
+
+from sglang.srt.hf_transformers_utils import check_gguf_file
+from sglang.srt.utils import (
+    get_amdgpu_memory_capacity,
+    get_nvgpu_memory_capacity,
+    is_flashinfer_available,
+    is_hip,
+    is_ipv6,
+    is_port_available,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +52,7 @@ class ServerArgs:
     served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
     is_embedding: bool = False
+    revision: Optional[str] = None
 
     # Port
     host: str = "127.0.0.1"
@@ -53,10 +62,11 @@ class ServerArgs:
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
-    chunked_prefill_size: int = 8192
+    chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
+    cpu_offload_gb: int = 0
 
     # Other runtime options
     tp_size: int = 1
@@ -64,6 +74,8 @@ class ServerArgs:
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     watchdog_timeout: float = 300
+    download_dir: Optional[str] = None
+    base_gpu_id: int = 0
 
     # Logging
     log_level: str = "info"
@@ -81,6 +93,8 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
+    # Expert parallelism
+    ep_size: int = 1
 
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
@@ -108,23 +122,22 @@ class ServerArgs:
     grammar_backend: Optional[str] = "outlines"
 
     # Optimization/debug options
-    disable_flashinfer: bool = False
-    disable_flashinfer_sampling: bool = False
     disable_radix_cache: bool = False
     disable_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
-    disable_disk_cache: bool = False
+    disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
-    disable_penalizer: bool = False
-    disable_nan_detection: bool = False
-    enable_overlap_schedule: bool = False
+    disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
+    enable_dp_attention: bool = False
+    enable_ep_moe: bool = False
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
-    cuda_graph_max_bs: int = 160
+    cuda_graph_max_bs: Optional[int] = None
     torchao_config: str = ""
+    enable_nan_detection: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
     num_continuous_decode_steps: int = 1
@@ -138,16 +151,23 @@ class ServerArgs:
         if self.served_model_name is None:
             self.served_model_name = self.model_path
 
-        if self.chunked_prefill_size <= 0:
-            # Disable chunked prefill
-            self.chunked_prefill_size = None
+        if self.random_seed is None:
+            self.random_seed = random.randint(0, 1 << 30)
 
-        # Mem fraction depends on the tensor parallelism size
+        if is_hip():
+            gpu_mem = get_amdgpu_memory_capacity()
+        elif torch.cuda.is_available():
+            gpu_mem = get_nvgpu_memory_capacity()
+        else:
+            # GPU memory is not known yet or no GPU is available.
+            gpu_mem = None
+
+        # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
                 self.mem_fraction_static = 0.79
             elif self.tp_size >= 8:
-                self.mem_fraction_static = 0.83
+                self.mem_fraction_static = 0.81
             elif self.tp_size >= 4:
                 self.mem_fraction_static = 0.85
             elif self.tp_size >= 2:
@@ -155,54 +175,62 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
-        if self.random_seed is None:
-            self.random_seed = random.randint(0, 1 << 30)
+        # Set chunked prefill size, which depends on the gpu memory capacity
+        if self.chunked_prefill_size is None:
+            if gpu_mem is not None and gpu_mem < 25_000:
+                self.chunked_prefill_size = 2048
+            else:
+                self.chunked_prefill_size = 8192
 
-        # Deprecation warnings
-        if self.disable_flashinfer:
-            logger.warning(
-                "The option '--disable-flashinfer' will be deprecated in the next release. "
-                "Please use '--attention-backend triton' instead."
-            )
-            self.attention_backend = "triton"
-        if self.disable_flashinfer_sampling:
-            logger.warning(
-                "The option '--disable-flashinfer-sampling' will be deprecated in the next release. "
-                "Please use '--sampling-backend pytorch' instead. "
-            )
-            self.sampling_backend = "pytorch"
+        # Set cuda graph max batch size
+        if self.cuda_graph_max_bs is None:
+            if gpu_mem is not None and gpu_mem < 25_000:
+                self.cuda_graph_max_bs = 8
+            else:
+                self.cuda_graph_max_bs = 160
 
-        if not is_flashinfer_available():
-            self.attention_backend = "triton"
-            self.sampling_backend = "pytorch"
-
-        # Default kernel backends
+        # Choose kernel backends
         if self.attention_backend is None:
-            self.attention_backend = "flashinfer"
-
+            self.attention_backend = (
+                "flashinfer" if is_flashinfer_available() else "triton"
+            )
         if self.sampling_backend is None:
-            self.sampling_backend = "flashinfer"
+            self.sampling_backend = (
+                "flashinfer" if is_flashinfer_available() else "pytorch"
+            )
 
-        if self.enable_overlap_schedule:
+        if self.attention_backend == "torch_native":
             logger.warning(
-                "Overlap scheduler mode is enabled. This is an experimental feature. "
-                "Sampling penalizer (e.g., frequency and repetition penalty), constrained decoding (e.g., regex, JSON), "
-                "and embedding APIs are not supported and will lead to wrong results. "
-                "The NaN detection is also disabled."
+                "Cuda graph is disabled because of using torch native attention backend"
             )
-            self.disable_penalizer = True
-            self.disable_nan_detection = True
+            self.disable_cuda_graph = True
 
-        # Model-specific patches
-        if "Alibaba-NLP/gte-Qwen2-1.5B-instruct" == self.model_path:
+        # Others
+        if self.enable_dp_attention:
+            self.dp_size = self.tp_size
+            self.chunked_prefill_size = self.chunked_prefill_size // 2
+            self.cuda_graph_max_bs = min(self.cuda_graph_max_bs, 96)
+            self.schedule_conservativeness = self.schedule_conservativeness * 0.3
+            self.disable_overlap_schedule = True
+            logger.warning(
+                f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
+                f"The CUDA graph max batch size is adjusted to {self.cuda_graph_max_bs}. "
+                f"The schedule conservativeness is adjusted to {self.schedule_conservativeness}. "
+                "Data parallel size is adjusted to be the same as tensor parallel size. "
+                "Overlap scheduler is disabled."
+            )
+        # Expert parallelism
+        if self.enable_ep_moe:
+            self.ep_size = self.tp_size
             logger.info(
-                "Not sure why, the tokenizer will add an additional token at the end of the prompt when trust_remote_mode=True"
+                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
-            self.trust_remote_code = False
 
-        if "gemma-2" in self.model_path.lower():
-            logger.info("When using sliding window in gemma-2, turn on flashinfer.")
-            self.attention_backend = "flashinfer"
+        # GGUF
+        if (
+            self.load_format == "auto" or self.load_format == "gguf"
+        ) and check_gguf_file(self.model_path):
+            self.quantization = self.load_format = "gguf"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -243,7 +271,7 @@ class ServerArgs:
             "--load-format",
             type=str,
             default=ServerArgs.load_format,
-            choices=["auto", "pt", "safetensors", "npcache", "dummy"],
+            choices=["auto", "pt", "safetensors", "npcache", "dummy", "gguf"],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
             "and fall back to the pytorch bin format if safetensors format "
@@ -253,7 +281,8 @@ class ServerArgs:
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values, '
-            "which is mainly for profiling.",
+            "which is mainly for profiling."
+            '"gguf" will load the weights in the gguf format. ',
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -293,6 +322,7 @@ class ServerArgs:
                 "gptq_marlin",
                 "awq_marlin",
                 "bitsandbytes",
+                "gguf",
             ],
             help="The quantization method.",
         )
@@ -306,7 +336,7 @@ class ServerArgs:
             "--device",
             type=str,
             default="cuda",
-            choices=["cuda", "xpu"],
+            choices=["cuda", "xpu", "hpu"],
             help="The device type.",
         )
         parser.add_argument(
@@ -325,6 +355,14 @@ class ServerArgs:
             "--is-embedding",
             action="store_true",
             help="Whether to use a CausalLM as an embedding model.",
+        )
+        parser.add_argument(
+            "--revision",
+            type=str,
+            default=None,
+            help="The specific model version to use. It can be a branch "
+            "name, a tag name, or a commit id. If unspecified, will use "
+            "the default version.",
         )
 
         # Memory and scheduling
@@ -373,6 +411,13 @@ class ServerArgs:
             help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
         )
 
+        parser.add_argument(
+            "--cpu-offload-gb",
+            type=int,
+            default=ServerArgs.cpu_offload_gb,
+            help="How many GBs of RAM to reserve for CPU offloading",
+        )
+
         # Other runtime options
         parser.add_argument(
             "--tensor-parallel-size",
@@ -404,6 +449,18 @@ class ServerArgs:
             type=float,
             default=ServerArgs.watchdog_timeout,
             help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
+        )
+        parser.add_argument(
+            "--download-dir",
+            type=str,
+            default=ServerArgs.download_dir,
+            help="Model download directory.",
+        )
+        parser.add_argument(
+            "--base-gpu-id",
+            type=int,
+            default=ServerArgs.base_gpu_id,
+            help="The base GPU ID to start allocating GPUs from. Useful when running multiple instances on the same machine.",
         )
 
         # Logging
@@ -477,6 +534,14 @@ class ServerArgs:
                 "round_robin",
                 "shortest_queue",
             ],
+        )
+        # Expert parallelism
+        parser.add_argument(
+            "--expert-parallel-size",
+            "--ep-size",
+            type=int,
+            default=ServerArgs.ep_size,
+            help="The expert parallelism size.",
         )
 
         # Multi-node distributed serving
@@ -558,7 +623,7 @@ class ServerArgs:
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=["flashinfer", "triton"],
+            choices=["flashinfer", "triton", "torch_native"],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
@@ -578,16 +643,6 @@ class ServerArgs:
         )
 
         # Optimization/debug options
-        parser.add_argument(
-            "--disable-flashinfer",
-            action="store_true",
-            help="Disable flashinfer attention kernels. This option will be deprecated in the next release. Please use '--attention-backend triton' instead.",
-        )
-        parser.add_argument(
-            "--disable-flashinfer-sampling",
-            action="store_true",
-            help="Disable flashinfer sampling kernels. This option will be deprecated in the next release. Please use '--sampling-backend pytorch' instead.",
-        )
         parser.add_argument(
             "--disable-radix-cache",
             action="store_true",
@@ -609,9 +664,9 @@ class ServerArgs:
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
         )
         parser.add_argument(
-            "--disable-disk-cache",
+            "--disable-outlines-disk-cache",
             action="store_true",
-            help="Disable disk cache to avoid possible crashes related to file system or high concurrency.",
+            help="Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
         )
         parser.add_argument(
             "--disable-custom-all-reduce",
@@ -624,24 +679,29 @@ class ServerArgs:
             help="Disable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
         )
         parser.add_argument(
-            "--disable-penalizer",
-            action="store_true",
-            help="Disable the logit penalizers (e.g., frequency and repetition penalty) for better performance if they are not used in any requests.",
-        )
-        parser.add_argument(
             "--disable-nan-detection",
             action="store_true",
             help="Disable the NaN detection for better performance.",
         )
         parser.add_argument(
-            "--enable-overlap-schedule",
+            "--disable-overlap-schedule",
             action="store_true",
-            help="Overlap the CPU scheduler with GPU model worker. Experimental feature.",
+            help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
         )
         parser.add_argument(
             "--enable-mixed-chunk",
             action="store_true",
             help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
+        )
+        parser.add_argument(
+            "--enable-dp-attention",
+            action="store_true",
+            help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
+        )
+        parser.add_argument(
+            "--enable-ep-moe",
+            action="store_true",
+            help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
         )
         parser.add_argument(
             "--enable-torch-compile",
@@ -664,7 +724,12 @@ class ServerArgs:
             "--torchao-config",
             type=str,
             default=ServerArgs.torchao_config,
-            help="Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo",
+            help="Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
+        )
+        parser.add_argument(
+            "--enable-nan-detection",
+            action="store_true",
+            help="Enable the NaN detection for debugging purposes.",
         )
         parser.add_argument(
             "--enable-p2p-check",
@@ -691,10 +756,33 @@ class ServerArgs:
             help="Delete the model checkpoint after loading the model.",
         )
 
+        # Deprecated arguments
+        parser.add_argument(
+            "--enable-overlap-schedule",
+            action=DeprecatedAction,
+            help="'--enable-overlap-schedule' is deprecated. It is enabled by default now. Please drop this argument.",
+        )
+        parser.add_argument(
+            "--disable-flashinfer",
+            action=DeprecatedAction,
+            help="'--disable-flashinfer' is deprecated. Please use '--attention-backend triton' instead.",
+        )
+        parser.add_argument(
+            "--disable-flashinfer-sampling",
+            action=DeprecatedAction,
+            help="'--disable-flashinfer-sampling' is deprecated. Please use '--sampling-backend pytroch' instead.",
+        )
+        parser.add_argument(
+            "--disable-disk-cache",
+            action=DeprecatedAction,
+            help="'--disable-disk-cache' is deprecated. Please use '--disable-outlines-disk-cache' instead.",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
         args.dp_size = args.data_parallel_size
+        args.ep_size = args.expert_parallel_size
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
@@ -717,6 +805,7 @@ class ServerArgs:
             and (self.lora_paths is None or self.disable_cuda_graph)
             and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and cuda graph and radix attention is in progress"
+        assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
 
         if isinstance(self.lora_paths, list):
             lora_paths = self.lora_paths
@@ -761,7 +850,7 @@ class PortArgs:
 
     @staticmethod
     def init_new(server_args) -> "PortArgs":
-        port = server_args.port + 42
+        port = server_args.port + random.randint(100, 1000)
         while True:
             if is_port_available(port):
                 break
@@ -784,3 +873,13 @@ class LoRAPathAction(argparse.Action):
                 getattr(namespace, self.dest)[name] = path
             else:
                 getattr(namespace, self.dest)[lora_path] = lora_path
+
+
+class DeprecatedAction(argparse.Action):
+    def __init__(self, option_strings, dest, nargs=0, **kwargs):
+        super(DeprecatedAction, self).__init__(
+            option_strings, dest, nargs=nargs, **kwargs
+        )
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        raise ValueError(self.help)
