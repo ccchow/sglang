@@ -191,6 +191,24 @@ def call_generate_srt_raw(prompt, temperature, max_tokens, stop=None, url=None):
     return pred
 
 
+def call_generate_gserver(prompt, temperature, max_tokens, stop=None, url=None):
+    """Send a generate request to a gserver backend."""
+    assert url is not None
+
+    data = {
+        "prompt": prompt,
+        "temperature": temperature,
+        "max_new_tokens": max_tokens,
+    }
+    if stop is not None:
+        data["stop"] = stop
+
+    res = requests.post(url, json=data)
+    res.raise_for_status()
+    obj = res.json()
+    return obj.get("text") or obj.get("generated_text") or obj.get("output")
+
+
 def call_generate_guidance(
     prompt, temperature, max_tokens, stop=None, n=1, regex=None, model=None
 ):
