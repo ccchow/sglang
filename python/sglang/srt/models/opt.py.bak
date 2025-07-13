@@ -1,0 +1,279 @@
+"""
+Inference-only OPT model compatible with HuggingFace weights.
+Based on the GPT2 implementation, adapted for OPT architecture.
+"""
+from typing import Iterable, Optional, Tuple, Type
+
+import torch
+from torch import nn
+from transformers import OPTConfig
+
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
+from sglang.srt.layers.activation import NewGELU
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import add_prefix
+
+
+class OPTAttention(nn.Module):
+    def __init__(
+        self,
+        layer_id: int,
+        config: OPTConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.layer_id = layer_id
+        self.hidden_size = config.hidden_size
+        tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = config.num_attention_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        self.head_dim = self.hidden_size // self.total_num_heads
+        self.scaling = self.head_dim**-0.5
+
+        # OPT uses separate q, k, v projections
+        self.q_proj = ColumnParallelLinear(
+            config.hidden_size,
+            config.hidden_size,
+            bias=config.enable_bias,
+            quant_config=quant_config,
+        )
+        self.k_proj = ColumnParallelLinear(
+            config.hidden_size,
+            config.hidden_size,
+            bias=config.enable_bias,
+            quant_config=quant_config,
+        )
+        self.v_proj = ColumnParallelLinear(
+            config.hidden_size,
+            config.hidden_size,
+            bias=config.enable_bias,
+            quant_config=quant_config,
+        )
+        self.out_proj = RowParallelLinear(
+            config.hidden_size,
+            config.hidden_size,
+            bias=config.enable_bias,
+            quant_config=quant_config,
+        )
+
+        # Attention implementation
+        self.attn = RadixAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_heads,
+            layer_id=layer_id,
+        )
+
+    def forward(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+        q, _ = self.q_proj(hidden_states)
+        k, _ = self.k_proj(hidden_states)
+        v, _ = self.v_proj(hidden_states)
+        attn_output = self.attn(q, k, v, forward_batch)
+        output, _ = self.out_proj(attn_output)
+        return output
+
+
+class OPTMLP(nn.Module):
+    def __init__(
+        self,
+        config: OPTConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
+        super().__init__()
+        self.fc1 = ColumnParallelLinear(
+            config.hidden_size,
+            config.ffn_dim,
+            bias=config.enable_bias,
+            quant_config=quant_config,
+        )
+        self.fc2 = RowParallelLinear(
+            config.ffn_dim,
+            config.hidden_size,
+            bias=config.enable_bias,
+            quant_config=quant_config,
+        )
+        self.act = NewGELU()
+
+    def forward(self, hidden_states):
+        hidden_states, _ = self.fc1(hidden_states)
+        hidden_states = self.act(hidden_states)
+        hidden_states, _ = self.fc2(hidden_states)
+        return hidden_states
+
+
+class OPTDecoderLayer(nn.Module):
+    def __init__(
+        self,
+        layer_id: int,
+        config: OPTConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
+        super().__init__()
+        self.self_attn_layer_norm = nn.LayerNorm(
+            config.hidden_size, elementwise_affine=config.layer_norm_elementwise_affine
+        )
+        self.self_attn = OPTAttention(
+            layer_id=layer_id,
+            config=config,
+            quant_config=quant_config,
+        )
+        self.final_layer_norm = nn.LayerNorm(
+            config.hidden_size, elementwise_affine=config.layer_norm_elementwise_affine
+        )
+        self.fc = OPTMLP(config, quant_config=quant_config)
+
+    def forward(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+        # Self Attention
+        residual = hidden_states
+        hidden_states = self.self_attn_layer_norm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, forward_batch)
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.final_layer_norm(hidden_states)
+        hidden_states = self.fc(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+
+class OPTModel(nn.Module):
+    def __init__(
+        self,
+        config: OPTConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
+        super().__init__()
+        self.padding_idx = config.pad_token_id
+        self.max_position_embeddings = config.max_position_embeddings
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size, config.word_embed_proj_dim, config.pad_token_id
+        )
+        self.embed_positions = nn.Embedding(
+            config.max_position_embeddings + 2, config.hidden_size
+        )
+
+        # Project if word embedding dimension != hidden dimension
+        if config.word_embed_proj_dim != config.hidden_size:
+            self.project_in = nn.Linear(
+                config.word_embed_proj_dim, config.hidden_size, bias=False
+            )
+        else:
+            self.project_in = None
+
+        self.layers = nn.ModuleList(
+            [
+                OPTDecoderLayer(i, config, quant_config)
+                for i in range(config.num_hidden_layers)
+            ]
+        )
+
+        if config.word_embed_proj_dim != config.hidden_size:
+            self.project_out = nn.Linear(
+                config.hidden_size, config.word_embed_proj_dim, bias=False
+            )
+        else:
+            self.project_out = None
+
+        self.final_layer_norm = nn.LayerNorm(
+            config.hidden_size, elementwise_affine=config.layer_norm_elementwise_affine
+        )
+
+    def forward(self, input_ids: torch.Tensor, forward_batch: ForwardBatch):
+        inputs_embeds = self.embed_tokens(input_ids)
+        
+        # Create position embeddings
+        seq_length = input_ids.shape[1]
+        positions = torch.arange(
+            0, seq_length, dtype=torch.long, device=input_ids.device
+        )
+        positions = positions.unsqueeze(0).expand_as(input_ids) + 2
+        
+        pos_embeds = self.embed_positions(positions)
+
+        if self.project_in is not None:
+            inputs_embeds = self.project_in(inputs_embeds)
+
+        hidden_states = inputs_embeds + pos_embeds
+
+        for i, layer in enumerate(self.layers):
+            hidden_states = layer(hidden_states, forward_batch)
+
+        hidden_states = self.final_layer_norm(hidden_states)
+
+        if self.project_out is not None:
+            hidden_states = self.project_out(hidden_states)
+
+        return hidden_states
+
+
+class OPTForCausalLM(nn.Module):
+    def __init__(
+        self,
+        config: OPTConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
+        super().__init__()
+        self.config = config
+        self.quant_config = quant_config
+        self.model = OPTModel(config, quant_config)
+        self.lm_head = ParallelLMHead(config.vocab_size, config.word_embed_proj_dim)
+        self.logits_processor = LogitsProcessor(config)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        hidden_states = self.model(input_ids, forward_batch)
+        logits = self.lm_head(hidden_states)
+        logits = self.logits_processor(logits, hidden_states, forward_batch)
+        return logits
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = []
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+
+        for name, loaded_weight in weights:
+            if "lm_head.weight" in name:
+                # OPT shares the embedding weights with lm_head
+                continue
+                
+            if ".project_in." in name or ".project_out." in name:
+                # Handle projection layers
+                if "project_in" in name:
+                    param = params_dict.get(name.replace("decoder.", "model."))
+                else:
+                    param = params_dict.get(name.replace("decoder.", "model."))
+            else:
+                # Standard weight mapping
+                param = params_dict.get(name.replace("decoder.", "model."))
+                
+            if param is not None:
+                weight_loader = getattr(
+                    param, "weight_loader", default_weight_loader
+                )
+                weight_loader(param, loaded_weight)
+                
+        # Share embedding weights with lm_head
+        self.lm_head.weight = self.model.embed_tokens.weight
+
+
+# Export the model class for registry
+EntryClass = OPTForCausalLM

@@ -13,7 +13,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bert import BertEncoder
 
-RobertaConfig = None
+try:
+    from transformers import RobertaConfig
+except ImportError:
+    RobertaConfig = None
 
 
 # Adapted from transformers
@@ -283,4 +286,130 @@ class XLMRobertaForSequenceClassification(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = [XLMRobertaModel, XLMRobertaForSequenceClassification]
+class RobertaLMHead(nn.Module):
+    """Head for masked language modeling."""
+
+    def __init__(self, config: RobertaConfig):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.decoder = nn.Linear(config.hidden_size, config.vocab_size)
+        self.bias = nn.Parameter(torch.zeros(config.vocab_size))
+        self.decoder.bias = self.bias
+
+    def forward(self, features):
+        x = self.dense(features)
+        x = nn.functional.gelu(x)
+        x = self.layer_norm(x)
+        x = self.decoder(x)
+        return x
+
+
+class XLMRobertaForMaskedLM(nn.Module):
+    def __init__(
+        self,
+        *,
+        config: RobertaConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.roberta = XLMRobertaBaseModel(
+            config=config, quant_config=quant_config, prefix=prefix
+        )
+        self.lm_head = RobertaLMHead(config)
+        self.loss_fn = nn.CrossEntropyLoss(reduction="mean")
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        get_embedding: bool = True,
+    ) -> torch.Tensor:
+        hidden_states = self.roberta(
+            input_ids, positions, forward_batch, input_embeds, get_embedding
+        )
+        
+        # Apply LM head to get predictions
+        prediction_scores = self.lm_head(hidden_states)
+        
+        # If labels are provided in forward_batch, compute loss
+        if hasattr(forward_batch, 'labels') and forward_batch.labels is not None:
+            labels = forward_batch.labels
+            # Only compute loss on masked positions (labels != -100)
+            masked_lm_loss = self.loss_fn(
+                prediction_scores.view(-1, prediction_scores.size(-1)),
+                labels.view(-1)
+            )
+            return masked_lm_loss, prediction_scores
+        
+        return prediction_scores
+
+    def compute_mlm_logits(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Compute MLM logits for specific positions (e.g., [MASK] tokens)."""
+        prediction_scores = self.forward(
+            input_ids, positions, forward_batch, get_embedding=True
+        )
+        
+        # If mask_positions are provided, return only those logits
+        if hasattr(forward_batch, 'mask_positions') and forward_batch.mask_positions is not None:
+            batch_size = prediction_scores.shape[0]
+            mask_positions = forward_batch.mask_positions
+            
+            # Gather logits at mask positions
+            mask_logits = []
+            for i in range(batch_size):
+                if i < len(mask_positions):
+                    pos = mask_positions[i]
+                    mask_logits.append(prediction_scores[i, pos])
+            
+            if mask_logits:
+                return torch.stack(mask_logits)
+        
+        return prediction_scores
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        self_weights = []
+
+        def weight_filter():
+            for name, weight in weights:
+                if name.startswith("roberta."):
+                    yield (name[len("roberta.") :], weight)
+                elif name.startswith("lm_head."):
+                    self_weights.append((name, weight))
+                else:
+                    # Handle alternative naming conventions
+                    if "cls.predictions" in name:
+                        # Transform HuggingFace naming to our naming
+                        new_name = name.replace("cls.predictions.transform", "lm_head")
+                        new_name = new_name.replace("cls.predictions.decoder", "lm_head.decoder")
+                        new_name = new_name.replace("cls.predictions.bias", "lm_head.bias")
+                        self_weights.append((new_name, weight))
+                    else:
+                        self_weights.append((name, weight))
+
+        self.roberta.load_weights(weight_filter())
+
+        params_dict = dict(self.named_parameters())
+
+        for name, loaded_weight in self_weights:
+            if name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+            else:
+                # Handle bias sharing between lm_head.decoder and lm_head.bias
+                if name == "lm_head.bias" and "lm_head.decoder.bias" in params_dict:
+                    param = params_dict["lm_head.decoder.bias"]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
+
+
+EntryClass = [XLMRobertaModel, XLMRobertaForSequenceClassification, XLMRobertaForMaskedLM]

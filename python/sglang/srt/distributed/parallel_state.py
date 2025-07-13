@@ -49,6 +49,8 @@ from sglang.srt.utils import (
     supports_custom_op,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class GraphCaptureContext:
@@ -1157,6 +1159,19 @@ def init_distributed_environment(
             rank=rank,
             timeout=timeout,
         )
+    else:
+        # Check if already initialized when SGLANG_ALLOW_REUSE_DISTRIBUTED is set
+        if get_bool_env_var("SGLANG_ALLOW_REUSE_DISTRIBUTED", "false"):
+            existing_world_size = torch.distributed.get_world_size()
+            existing_rank = torch.distributed.get_rank()
+            if existing_world_size == world_size and existing_rank == rank:
+                logger.info("Reusing existing torch.distributed initialization")
+            else:
+                raise ValueError(
+                    f"Distributed already initialized with different config. "
+                    f"Existing: world_size={existing_world_size}, rank={existing_rank}. "
+                    f"Requested: world_size={world_size}, rank={rank}"
+                )
 
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
@@ -1220,41 +1235,74 @@ def initialize_model_parallel(
     # Build the tensor model-parallel groups.
     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
     global _TP
-    assert _TP is None, "tensor model parallel group is already initialized"
-    group_ranks = []
-    for i in range(num_tensor_model_parallel_groups):
-        ranks = list(
-            range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
-        )
-        group_ranks.append(ranks)
+    
+    # Allow reuse when SGLANG_ALLOW_REUSE_DISTRIBUTED is set
+    if get_bool_env_var("SGLANG_ALLOW_REUSE_DISTRIBUTED", "false"):
+        if _TP is not None:
+            # Verify existing matches requirements
+            existing_tp_size = get_tensor_model_parallel_world_size()
+            if existing_tp_size != tensor_model_parallel_size:
+                raise ValueError(
+                    f"Tensor parallel already initialized with different size. "
+                    f"Existing: {existing_tp_size}, Requested: {tensor_model_parallel_size}"
+                )
+            logger.info(f"Reusing existing tensor parallel group (size={existing_tp_size})")
+            # Continue to check pipeline parallel
+        else:
+            # Will initialize below
+            pass
+    else:
+        assert _TP is None, "tensor model parallel group is already initialized"
+    if _TP is None:  # Only initialize if not already done
+        group_ranks = []
+        for i in range(num_tensor_model_parallel_groups):
+            ranks = list(
+                range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
+            )
+            group_ranks.append(ranks)
 
-    # message queue broadcaster is only used in tensor model parallel group
-    _TP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_message_queue_broadcaster=get_bool_env_var(
-            "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
-        ),
-        group_name="tp",
-    )
+        # message queue broadcaster is only used in tensor model parallel group
+        _TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=get_bool_env_var(
+                "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
+            ),
+            group_name="tp",
+        )
 
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
     global _PP
-    assert _PP is None, "pipeline model parallel group is already initialized"
-    group_ranks = []
-    for i in range(num_pipeline_model_parallel_groups):
-        ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
-        group_ranks.append(ranks)
-    # pipeline parallel does not need custom allreduce
-    _PP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_custom_allreduce=False,
-        group_name="pp",
-    )
+    
+    # Allow reuse when SGLANG_ALLOW_REUSE_DISTRIBUTED is set
+    if get_bool_env_var("SGLANG_ALLOW_REUSE_DISTRIBUTED", "false"):
+        if _PP is not None:
+            # Verify existing matches requirements
+            existing_pp_size = get_pp_group().world_size
+            if existing_pp_size != pipeline_model_parallel_size:
+                raise ValueError(
+                    f"Pipeline parallel already initialized with different size. "
+                    f"Existing: {existing_pp_size}, Requested: {pipeline_model_parallel_size}"
+                )
+            logger.info(f"Reusing existing pipeline parallel group (size={existing_pp_size})")
+            return  # Skip the rest of initialization
+    else:
+        assert _PP is None, "pipeline model parallel group is already initialized"
+    if _PP is None:  # Only initialize if not already done
+        group_ranks = []
+        for i in range(num_pipeline_model_parallel_groups):
+            ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
+            group_ranks.append(ranks)
+        # pipeline parallel does not need custom allreduce
+        _PP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_custom_allreduce=False,
+            group_name="pp",
+        )
 
 
 def ensure_model_parallel_initialized(

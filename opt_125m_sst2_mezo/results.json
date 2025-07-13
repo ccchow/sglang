@@ -1,0 +1,14 @@
+{
+  "total_time": 45.733513593673706,
+  "final_train_loss": 10.33932113647461,
+  "final_eval_loss": 10.329462732587542,
+  "steps_per_second": 21.86580302761451,
+  "config": {
+    "model": "facebook/opt-125m",
+    "num_steps": 1000,
+    "batch_size": 16,
+    "learning_rate": 1e-06,
+    "epsilon": 0.001,
+    "lora_rank": 8
+  }
+}

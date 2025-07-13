@@ -273,6 +273,13 @@ def get_global_expert_location_metadata():
 
 def set_global_expert_location_metadata(value):
     global _global_expert_location_metadata
+    if _global_expert_location_metadata is not None:
+        import os
+        from sglang.srt.utils import get_bool_env_var
+        if get_bool_env_var("SGLANG_ALLOW_REUSE_DISTRIBUTED", "false"):
+            # Allow resetting when reusing distributed
+            _global_expert_location_metadata = value
+            return
     assert _global_expert_location_metadata is None
     _global_expert_location_metadata = value
 

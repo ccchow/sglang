@@ -1,0 +1,146 @@
+--- parallel_state.py.orig	2024-01-01 00:00:00.000000000 +0000
++++ parallel_state.py	2024-01-01 00:00:00.000000000 +0000
+@@ -1148,6 +1148,15 @@ def init_distributed_environment(
+     else:
+         if timeout is not None and not isinstance(timeout, timedelta):
+             timeout = timedelta(seconds=timeout)
++            
++        # Check if already initialized when SGLANG_ALLOW_REUSE_DISTRIBUTED is set
++        if get_bool_env_var("SGLANG_ALLOW_REUSE_DISTRIBUTED", "false"):
++            if torch.distributed.is_initialized():
++                existing_world_size = torch.distributed.get_world_size()
++                existing_rank = torch.distributed.get_rank()
++                if existing_world_size == world_size and existing_rank == rank:
++                    logger.info("Reusing existing torch.distributed initialization")
++                    # Skip torch.distributed.init_process_group
++                else:
++                    raise ValueError(
++                        f"Distributed already initialized with different config. "
++                        f"Existing: world_size={existing_world_size}, rank={existing_rank}. "
++                        f"Requested: world_size={world_size}, rank={rank}"
++                    )
++            else:
++                # this backend is used for WORLD
++                torch.distributed.init_process_group(
++                    backend=backend,
++                    init_method=distributed_init_method,
++                    world_size=world_size,
++                    rank=rank,
++                    timeout=timeout,
++                )
++        else:
++            # Original behavior
++            # this backend is used for WORLD
++            torch.distributed.init_process_group(
++                backend=backend,
++                init_method=distributed_init_method,
++                world_size=world_size,
++                rank=rank,
++                timeout=timeout,
++            )
+ 
+-        # this backend is used for WORLD
+-        torch.distributed.init_process_group(
+-            backend=backend,
+-            init_method=distributed_init_method,
+-            world_size=world_size,
+-            rank=rank,
+-            timeout=timeout,
+-        )
+ 
+     # set the local rank
+     # local_rank is not available in torch ProcessGroup,
+@@ -1220,7 +1260,21 @@ def initialize_model_parallel(
+     # Build the tensor model-parallel groups.
+     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
+     global _TP
+-    assert _TP is None, "tensor model parallel group is already initialized"
++    
++    # Allow reuse when SGLANG_ALLOW_REUSE_DISTRIBUTED is set
++    if get_bool_env_var("SGLANG_ALLOW_REUSE_DISTRIBUTED", "false"):
++        if _TP is not None:
++            # Verify existing matches requirements
++            existing_tp_size = get_tensor_model_parallel_world_size()
++            if existing_tp_size != tensor_model_parallel_size:
++                raise ValueError(
++                    f"Tensor parallel already initialized with different size. "
++                    f"Existing: {existing_tp_size}, Requested: {tensor_model_parallel_size}"
++                )
++            logger.info(f"Reusing existing tensor parallel group (size={existing_tp_size})")
++            # Skip the rest of tensor parallel initialization
++        else:
++            # Continue with normal initialization
++    else:
++        assert _TP is None, "tensor model parallel group is already initialized"
++        
+     group_ranks = []
+     for i in range(num_tensor_model_parallel_groups):
+         ranks = list(
+@@ -1228,29 +1282,51 @@ def initialize_model_parallel(
+         )
+         group_ranks.append(ranks)
+ 
+-    # message queue broadcaster is only used in tensor model parallel group
+-    _TP = init_model_parallel_group(
+-        group_ranks,
+-        get_world_group().local_rank,
+-        backend,
+-        use_message_queue_broadcaster=get_bool_env_var(
+-            "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
+-        ),
+-        group_name="tp",
+-    )
++    if _TP is None:  # Only initialize if not already done
++        # message queue broadcaster is only used in tensor model parallel group
++        _TP = init_model_parallel_group(
++            group_ranks,
++            get_world_group().local_rank,
++            backend,
++            use_message_queue_broadcaster=get_bool_env_var(
++                "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
++            ),
++            group_name="tp",
++        )
+ 
+     # Build the pipeline model-parallel groups.
+     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
+     global _PP
+-    assert _PP is None, "pipeline model parallel group is already initialized"
++    
++    # Allow reuse when SGLANG_ALLOW_REUSE_DISTRIBUTED is set
++    if get_bool_env_var("SGLANG_ALLOW_REUSE_DISTRIBUTED", "false"):
++        if _PP is not None:
++            # Verify existing matches requirements
++            existing_pp_size = get_pp_group().world_size
++            if existing_pp_size != pipeline_model_parallel_size:
++                raise ValueError(
++                    f"Pipeline parallel already initialized with different size. "
++                    f"Existing: {existing_pp_size}, Requested: {pipeline_model_parallel_size}"
++                )
++            logger.info(f"Reusing existing pipeline parallel group (size={existing_pp_size})")
++            return  # Skip the rest of initialization
++    else:
++        assert _PP is None, "pipeline model parallel group is already initialized"
++        
+     group_ranks = []
+     for i in range(num_pipeline_model_parallel_groups):
+         ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
+         group_ranks.append(ranks)
+-    # pipeline parallel does not need custom allreduce
+-    _PP = init_model_parallel_group(
+-        group_ranks,
+-        get_world_group().local_rank,
+-        backend,
+-        use_custom_allreduce=False,
+-        group_name="pp",
+-    )
++        
++    if _PP is None:  # Only initialize if not already done
++        # pipeline parallel does not need custom allreduce
++        _PP = init_model_parallel_group(
++            group_ranks,
++            get_world_group().local_rank,
++            backend,
++            use_custom_allreduce=False,
++            group_name="pp",
++        )
