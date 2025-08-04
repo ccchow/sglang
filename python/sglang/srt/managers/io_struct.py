@@ -1071,3 +1071,39 @@ class LoRAUpdateResult:
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
+
+
+@dataclass
+class MeZOTrainRequest:
+    """Request structure for MeZO training step."""
+    # Training batch - list of prompts and completions
+    batch: List[Dict[str, str]]  # Each dict has 'prompt' and 'completion'
+    # LoRA adapter name to train
+    lora_name: str
+    # MeZO hyperparameters
+    epsilon: float = 1e-3
+    learning_rate: float = 1e-5
+    # Optional: specify which LoRA modules to update
+    target_modules: Optional[List[str]] = None
+    # Whether to compute full sequence loss
+    use_full_sequence_loss: bool = False
+    # Request ID for tracking
+    rid: Optional[str] = None
+
+
+@dataclass
+class MeZOTrainResponse:
+    """Response structure for MeZO training step."""
+    # Training metrics
+    loss: float
+    gradient_norm: float
+    # Performance metrics
+    forward_time_ms: float
+    total_time_ms: float
+    tokens_processed: int
+    # Cache statistics if available
+    cache_hit_rate: Optional[float] = None
+    # Request tracking
+    rid: Optional[str] = None
+    # Error message if any
+    error: Optional[str] = None

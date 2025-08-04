@@ -41,6 +41,11 @@ LiteLLM = LazyImport("sglang.lang.backend.litellm", "LiteLLM")
 OpenAI = LazyImport("sglang.lang.backend.openai", "OpenAI")
 VertexAI = LazyImport("sglang.lang.backend.vertexai", "VertexAI")
 
+# MeZO Training APIs
+mezo_finetune = LazyImport("sglang.srt.mezo_finetune", "mezo_finetune")
+MeZOConfig = LazyImport("sglang.srt.mezo_config", "MeZOConfig")
+MeZOTrainer = LazyImport("sglang.srt.mezo_trainer", "MeZOTrainer")
+
 __all__ = [
     "Engine",
     "Runtime",
@@ -75,4 +80,7 @@ __all__ = [
     "VertexAI",
     "global_config",
     "__version__",
+    "mezo_finetune",
+    "MeZOConfig",
+    "MeZOTrainer",
 ]

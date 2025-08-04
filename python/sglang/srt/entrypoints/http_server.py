@@ -73,6 +73,8 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
+    MeZOTrainRequest,
+    MeZOTrainResponse,
     OpenSessionReqInput,
     ParseFunctionCallReq,
     ProfileReqInput,
@@ -868,6 +870,36 @@ async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
     return await raw_request.app.state.openai_serving_rerank.handle_request(
         request, raw_request
     )
+
+
+@app.post("/train/mezo", dependencies=[Depends(validate_json_request)])
+async def mezo_train_request(request: MeZOTrainRequest, raw_request: Request):
+    """Handle a MeZO training step."""
+    try:
+        # Check if we have a MeZO trainer initialized
+        if not hasattr(_global_state.tokenizer_manager, "mezo_trainer"):
+            from sglang.srt.mezo_server_trainer import MeZOServerTrainer
+            _global_state.tokenizer_manager.mezo_trainer = MeZOServerTrainer(
+                _global_state.tokenizer_manager
+            )
+        
+        # Execute the training step
+        response = await _global_state.tokenizer_manager.mezo_trainer.train_step(request)
+        # Convert dataclass to dict manually
+        return ORJSONResponse({
+            "loss": response.loss,
+            "gradient_norm": response.gradient_norm,
+            "forward_time_ms": response.forward_time_ms,
+            "total_time_ms": response.total_time_ms,
+            "tokens_processed": response.tokens_processed,
+            "cache_hit_rate": response.cache_hit_rate,
+            "rid": response.rid,
+            "error": response.error
+        })
+        
+    except Exception as e:
+        logger.error(f"MeZO training error: {str(e)}")
+        return _create_error_response(e)
 
 
 def _create_error_response(e):

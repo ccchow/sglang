@@ -144,6 +144,11 @@ class OPTAttention(nn.Module):
         # Apply RadixAttention
         attn_output = self.attn(q, k, v, forward_batch)
         
+        # Reshape attention output back to [seq_len, hidden_size]
+        # RadixAttention returns [seq_len, num_heads, head_dim]
+        seq_len = attn_output.shape[0]
+        attn_output = attn_output.view(seq_len, -1)
+        
         # Project output
         output, _ = self.out_proj(attn_output)
         return output
@@ -303,11 +308,21 @@ class OPTModel(nn.Module):
         inputs_embeds = self.embed_tokens(input_ids)
         
         # Position embeddings (OPT adds 2 to positions)
-        seq_length = input_ids.shape[1]
-        positions = torch.arange(
-            0, seq_length, dtype=torch.long, device=input_ids.device
-        )
-        positions = positions.unsqueeze(0).expand_as(input_ids) + 2
+        # During CUDA graph capture, input_ids is 1D, otherwise it's 2D
+        if input_ids.dim() == 1:
+            # 1D case (CUDA graph capture)
+            seq_length = input_ids.shape[0]
+            positions = torch.arange(
+                0, seq_length, dtype=torch.long, device=input_ids.device
+            ) + 2
+        else:
+            # 2D case (normal forward)
+            seq_length = input_ids.shape[1]
+            positions = torch.arange(
+                0, seq_length, dtype=torch.long, device=input_ids.device
+            )
+            positions = positions.unsqueeze(0).expand_as(input_ids) + 2
+        
         pos_embeds = self.embed_positions(positions)
 
         # Project embeddings if needed
@@ -362,12 +377,15 @@ class OPTForCausalLM(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
+        positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        # Note: positions argument is required for CUDA graph compatibility
+        # but OPT computes positions internally, so we don't use it
         hidden_states = self.model(input_ids, forward_batch)
-        logits = self.lm_head(hidden_states)
-        logits = self.logits_processor(logits, hidden_states, forward_batch)
-        return logits
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights from HuggingFace checkpoint."""

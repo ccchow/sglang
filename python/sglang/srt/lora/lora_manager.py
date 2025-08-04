@@ -16,6 +16,7 @@
 # and "Punica: Multi-Tenant LoRA Serving"
 
 import logging
+import re
 from typing import Dict, Set, Tuple
 
 import torch
@@ -481,3 +482,54 @@ class LoRAManager:
                     self.lora_modules[layer_id][module_name] = self.set_lora_module(
                         module_name, module
                     )
+
+    def update_lora_weights(self, lora_name: str, weight_updates: Dict[str, torch.Tensor]) -> bool:
+        """
+        Update LoRA weights for a specific adapter during training.
+        
+        Args:
+            lora_name: Name of the LoRA adapter to update
+            weight_updates: Dictionary mapping weight names to updated tensors
+            
+        Returns:
+            bool: True if update succeeded, False otherwise
+        """
+        if lora_name not in self.loras:
+            logger.error(f"LoRA adapter {lora_name} not found")
+            return False
+            
+        lora_adapter = self.loras[lora_name]
+        
+        # Update adapter weights in CPU memory
+        for weight_name, weight_tensor in weight_updates.items():
+            if "layers." in weight_name:
+                # Extract layer index from weight name
+                match = re.search(r"layers\.(\d+)\.", weight_name)
+                if match:
+                    layer_id = int(match.group(1))
+                    if layer_id < len(lora_adapter.layers):
+                        lora_adapter.layers[layer_id].weights[weight_name] = weight_tensor.cpu()
+                    else:
+                        logger.error(f"Invalid layer index {layer_id} in weight name {weight_name}")
+                        return False
+            else:
+                # Global weights
+                lora_adapter.weights[weight_name] = weight_tensor.cpu()
+        
+        # Re-normalize weights after update
+        for layer in lora_adapter.layers:
+            weight_names = list(layer.weights.keys())
+            lora_adapter.normalize_qkv_proj(weight_names, layer.weights)
+            lora_adapter.normalize_gate_up_proj(weight_names, layer.weights)
+        
+        # Force memory pool to reload this adapter's weights
+        # This ensures the GPU buffers are updated with new weights
+        if lora_name in self.memory_pool.uid_to_buffer_id:
+            buffer_id = self.memory_pool.uid_to_buffer_id[lora_name]
+            # Reload the weights into the existing buffer
+            self.memory_pool.load_lora_weight_to_buffer(
+                lora_name, buffer_id, lora_adapter, self.lora_modules
+            )
+            
+        logger.info(f"Updated weights for LoRA adapter {lora_name}")
+        return True
