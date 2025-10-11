@@ -205,3 +205,9 @@ class LoRARegistry:
         Returns the total number of LoRA adapters currently registered.
         """
         return len(self._registry)
+
+    async def has_lora(self, lora_name: str) -> bool:
+        """Return whether a LoRA adapter with the given name is registered."""
+
+        async with self._registry_lock.reader_lock:
+            return lora_name in self._registry

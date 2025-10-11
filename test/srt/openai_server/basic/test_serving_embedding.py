@@ -4,7 +4,7 @@ Unit tests for the OpenAIServingEmbedding class from serving_embedding.py.
 
 import unittest
 import uuid
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 from fastapi import Request
 
@@ -24,7 +24,10 @@ class _MockTokenizerManager:
         self.model_config.is_multimodal = False
         self.server_args = Mock()
         self.server_args.enable_cache_report = False
+        self.server_args.enable_lora = False
         self.model_path = "test-model"
+        self.served_model_name = "test-model"
+        self.lora_registry = Mock(has_lora=AsyncMock(return_value=False))
 
         # Mock tokenizer
         self.tokenizer = Mock()
