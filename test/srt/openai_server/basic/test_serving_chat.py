@@ -11,7 +11,7 @@ import json
 import unittest
 import uuid
 from typing import Optional
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import Request
 
@@ -32,8 +32,12 @@ class _MockTokenizerManager:
             enable_cache_report=False,
             tool_call_parser="hermes",
             reasoning_parser=None,
+            enable_lora=False,
         )
         self.chat_template_name: Optional[str] = "llama-3"
+        self.served_model_name = "base-model"
+        self.model_path = "base-model"
+        self.lora_registry = Mock(has_lora=AsyncMock(return_value=False))
 
         # tokenizer stub
         self.tokenizer = Mock()
@@ -96,6 +100,18 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+
+    def test_model_alias_sets_lora_path(self):
+        req = ChatCompletionRequest(
+            model="math-lora",
+            messages=[{"role": "user", "content": "Hi?"}],
+        )
+        self.tm.server_args.enable_lora = True
+        self.tm.lora_registry.has_lora.return_value = True
+
+        asyncio.run(self.chat._apply_lora_alias_if_needed(req))
+
+        self.assertEqual(req.lora_path, "math-lora")
 
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):

@@ -4,6 +4,7 @@ Run with:
     python -m unittest tests.test_serving_completions_unit -v
 """
 
+import asyncio
 import unittest
 from typing import Optional
 from unittest.mock import AsyncMock, Mock, patch
@@ -38,7 +39,10 @@ class ServingCompletionTestCase(unittest.TestCase):
         tm.tokenizer.bos_token_id = 1
 
         tm.model_config = Mock(is_multimodal=False)
-        tm.server_args = Mock(enable_cache_report=False)
+        tm.server_args = Mock(enable_cache_report=False, enable_lora=False)
+        tm.served_model_name = "base-model"
+        tm.model_path = "base-model"
+        tm.lora_registry = Mock(has_lora=AsyncMock(return_value=False))
 
         tm.generate_request = AsyncMock()
         tm.create_abort_task = Mock()
@@ -51,6 +55,15 @@ class ServingCompletionTestCase(unittest.TestCase):
         req = CompletionRequest(model="x", prompt="Hello world", max_tokens=100)
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.text, "Hello world")
+
+    def test_model_alias_sets_lora_path(self):
+        req = CompletionRequest(model="math-lora", prompt="Hello world")
+        self.sc.tokenizer_manager.server_args.enable_lora = True
+        self.sc.tokenizer_manager.lora_registry.has_lora.return_value = True
+
+        asyncio.run(self.sc._apply_lora_alias_if_needed(req))
+
+        self.assertEqual(req.lora_path, "math-lora")
 
     def test_single_token_ids_prompt(self):
         req = CompletionRequest(model="x", prompt=[1, 2, 3, 4], max_tokens=100)

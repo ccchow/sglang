@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
-from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    DEFAULT_MODEL_NAME,
+    ErrorResponse,
+    OpenAIServingRequest,
+)
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.server_args import ServerArgs
 
@@ -39,6 +43,8 @@ class OpenAIServingBase(ABC):
     ) -> Union[Any, StreamingResponse, ErrorResponse]:
         """Handle the specific request type with common pattern"""
         try:
+            await self._apply_lora_alias_if_needed(request)
+
             # Validate request
             error_msg = self._validate_request(request)
             if error_msg:
@@ -75,6 +81,62 @@ class OpenAIServingBase(ABC):
                 err_type="InternalServerError",
                 status_code=500,
             )
+
+    async def _apply_lora_alias_if_needed(
+        self, request: OpenAIServingRequest
+    ) -> None:
+        """Populate ``lora_path`` when clients specify a LoRA via the ``model`` field."""
+
+        if not hasattr(request, "lora_path") or not hasattr(request, "model"):
+            return
+
+        # Respect explicit lora_path values.
+        if getattr(request, "lora_path") is not None:
+            return
+
+        server_args = getattr(self.tokenizer_manager, "server_args", None)
+        if not server_args or not getattr(server_args, "enable_lora", False):
+            return
+
+        requested_model = getattr(request, "model", None)
+        if requested_model in (None, ""):
+            return
+
+        served_names = self._get_served_model_aliases()
+        served_names.add(DEFAULT_MODEL_NAME)
+        if requested_model in served_names:
+            return
+
+        registry = getattr(self.tokenizer_manager, "lora_registry", None)
+        if registry is None or not hasattr(registry, "has_lora"):
+            return
+
+        try:
+            has_lora = await registry.has_lora(requested_model)
+        except Exception:  # pragma: no cover - defensive, should not happen.
+            return
+
+        if has_lora:
+            logger.debug(
+                "Resolved LoRA adapter '%s' from model field", requested_model
+            )
+            setattr(request, "lora_path", requested_model)
+
+    def _get_served_model_aliases(self) -> set[str]:
+        """Return names that should map to the base model."""
+
+        aliases: set[str] = set()
+        served_model = getattr(self.tokenizer_manager, "served_model_name", None)
+        if served_model:
+            aliases.update(
+                name.strip() for name in served_model.split(",") if name.strip()
+            )
+
+        model_path = getattr(self.tokenizer_manager, "model_path", None)
+        if model_path:
+            aliases.add(model_path)
+
+        return aliases
 
     @abstractmethod
     def _request_id_prefix(self) -> str:
